@@ -2,6 +2,10 @@ name: Release
 on:
   push:
     tags: [ 'v*' ]
+
+permissions:
+  contents: read
+
 jobs:
   test:
     uses: ./.github/workflows/test.yaml
@@ -66,6 +70,8 @@ jobs:
     needs:
       - github-release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
