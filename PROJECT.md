@@ -183,6 +183,18 @@ point from quantization.
 - CPU training time. The recognizer budget is under two hours per
   training run so the search loop in iteration 3 stays feasible.
 
+## Reference point: stock openalpr on the same real images
+
+Measured before writing any model, so the ledger has something to beat.
+Details and the grammar experiment in `docs/grammar-experiment.md`, code
+map in `docs/openalpr-pipeline.md`.
+
+| Configuration | US EM | EU EM | BR EM | Det R |
+|---|---|---|---|---|
+| openalpr stock | 51.4 | 72.2 | 41.2 | 90 / 98 / 68 |
+| openalpr + union grammar re-rank | 58.6 | 73.1 | 61.4 | same |
+| openalpr + oracle jurisdiction grammar | 67.6 | 81.5 | 64.0 | same |
+
 ## Ledger
 
 Every row is a committed run. `make eval` reproduces it.

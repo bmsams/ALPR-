@@ -1,0 +1,217 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 9451294..5d6f908 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -257,7 +257,7 @@ SET (CPACK_PACKAGE_CONTACT "Matt Hill <matt@ndu.com>")
+ SET (CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}_${CPACK_PACKAGE_VERSION}_${CPACK_DEBIAN_ARCHITECTURE}")
+ 
+ SET (CPACK_COMPONENTS_ALL Libraries ApplicationData)
+-set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
++set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17")
+ set (CMAKE_CXX_STANDARD 11)
+ cmake_minimum_required(VERSION 3.1)
+ # Enable C++11
+diff --git a/src/openalpr/config.cpp b/src/openalpr/config.cpp
+index 1b085b2..ca624c4 100644
+--- a/src/openalpr/config.cpp
++++ b/src/openalpr/config.cpp
+@@ -199,6 +199,9 @@ namespace alpr
+     contrastDetectionThreshold = getFloat(ini, defaultIni, "", "contrast_detection_threshold", 0.3);
+     
+     mustMatchPattern = getBoolean(ini, defaultIni, "", "must_match_pattern", false);
++    postProcessSearchForMatch = getBoolean(ini, defaultIni, "", "postprocess_search_for_match", false);
++    postProcessConfusableRepair = getBoolean(ini, defaultIni, "", "postprocess_confusable_repair", false);
++    postProcessMatchFloor = getFloat(ini, defaultIni, "", "postprocess_match_floor", 0);
+     
+     skipDetection = getBoolean(ini, defaultIni, "", "skip_detection", false);
+     
+diff --git a/src/openalpr/config.h b/src/openalpr/config.h
+index 29973b8..a025a0f 100644
+--- a/src/openalpr/config.h
++++ b/src/openalpr/config.h
+@@ -115,6 +115,9 @@ namespace alpr
+       int ocrMinFontSize;
+ 
+       bool mustMatchPattern;
++      bool postProcessSearchForMatch;
++      bool postProcessConfusableRepair;
++      float postProcessMatchFloor;
+       
+       float postProcessMinConfidence;
+       float postProcessConfidenceSkipLevel;
+diff --git a/src/openalpr/postprocess/postprocess.cpp b/src/openalpr/postprocess/postprocess.cpp
+index 9a8f5a6..e028a02 100644
+--- a/src/openalpr/postprocess/postprocess.cpp
++++ b/src/openalpr/postprocess/postprocess.cpp
+@@ -27,6 +27,7 @@ using namespace std;
+ 
+ namespace alpr
+ {
++  static bool ppResultCompare( const PPResult &left, const PPResult &right );
+ 
+   PostProcess::PostProcess(Config* config)
+   {
+@@ -60,6 +61,89 @@ namespace alpr
+       }
+     }
+ 
++    // Pseudo-region "any": the union of every pattern in the file, so a
++    // caller can ask "does this read fit the grammar of any jurisdiction"
++    // without knowing which one.
++    vector<RegexRule*> all_rules;
++    for (map<string, vector<RegexRule*> >::iterator it = rules.begin(); it != rules.end(); ++it)
++      all_rules.insert(all_rules.end(), it->second.begin(), it->second.end());
++    rules["any"] = all_rules;
++  }
++
++  bool PostProcess::matchesAnyRule(string templateregion, string text)
++  {
++    vector<RegexRule*>& regionRules = rules[templateregion];
++    for (unsigned int i = 0; i < regionRules.size(); i++)
++      if (regionRules[i]->match(text))
++        return true;
++    return false;
++  }
++
++  // Mod C: Tesseract confuses glyph pairs whose only reliable disambiguator is
++  // whether the grammar wants a letter or a digit at that position. When no
++  // candidate matched a pattern, try flipping confusable characters in the
++  // top candidates until one fits, and add it with a penalized score.
++  static const char* CONFUSABLE_PAIRS[][2] = {
++    {"0","O"}, {"O","0"}, {"1","I"}, {"I","1"}, {"2","Z"}, {"Z","2"}, {"5","S"}, {"S","5"},
++    {"8","B"}, {"B","8"}, {"4","A"}, {"A","4"}, {"6","G"}, {"G","6"}, {"0","D"}, {"D","0"},
++    {"0","Q"}, {"Q","0"}, {"7","T"}, {"T","7"}, {"1","L"}, {"L","1"}
++  };
++
++  void PostProcess::repairConfusables(string templateregion, int topn)
++  {
++    const float FLIP_PENALTY = 0.93f;
++    const int MAX_FLIPS = 3;
++    vector<PPResult> repaired;
++    unsigned int limit = allPossibilities.size() < (unsigned int) topn ? allPossibilities.size() : topn;
++    for (unsigned int c = 0; c < limit; c++)
++    {
++      string base = allPossibilities[c].letters;
++      if (base.find('\n') != string::npos || allPossibilities[c].matchesTemplate)
++        continue;
++      // breadth-first over flip counts so the fewest-flip fix wins
++      set<string> seen; seen.insert(base);
++      vector<string> frontier; frontier.push_back(base);
++      bool done = false;
++      for (int depth = 1; depth <= MAX_FLIPS && !done; depth++)
++      {
++        vector<string> next;
++        for (unsigned int f = 0; f < frontier.size(); f++)
++        {
++          for (unsigned int pos = 0; pos < frontier[f].size(); pos++)
++          {
++            for (unsigned int k = 0; k < sizeof(CONFUSABLE_PAIRS)/sizeof(CONFUSABLE_PAIRS[0]); k++)
++            {
++              if (frontier[f][pos] != CONFUSABLE_PAIRS[k][0][0])
++                continue;
++              string cand = frontier[f];
++              cand[pos] = CONFUSABLE_PAIRS[k][1][0];
++              if (seen.count(cand))
++                continue;
++              seen.insert(cand);
++              if (allPossibilitiesLetters.count(cand))
++                continue;
++              if (matchesAnyRule(templateregion, cand))
++              {
++                PPResult r = allPossibilities[c];
++                r.letters = cand;
++                r.matchesTemplate = true;
++                r.totalscore = allPossibilities[c].totalscore;
++                for (int d = 0; d < depth; d++) r.totalscore *= FLIP_PENALTY;
++                repaired.push_back(r);
++                allPossibilitiesLetters.insert(cand);
++                done = true;
++              }
++              next.push_back(cand);
++            }
++          }
++        }
++        frontier = next;
++      }
++    }
++    if (repaired.empty())
++      return;
++    allPossibilities.insert(allPossibilities.end(), repaired.begin(), repaired.end());
++    std::stable_sort(allPossibilities.begin(), allPossibilities.end(), ppResultCompare);
+   }
+ 
+   PostProcess::~PostProcess()
+@@ -200,6 +284,20 @@ namespace alpr
+ 
+     findAllPermutations(templateregion, topn);
+ 
++    if (config->postProcessConfusableRepair && templateregion != "")
++      repairConfusables(templateregion, topn);
++
++    // A grammar match far below the best-scoring read is more likely a
++    // garbage string that happens to fit the pattern (usually by dropping
++    // characters) than the right answer. Below the floor it no longer counts.
++    if (config->postProcessMatchFloor > 0 && allPossibilities.size() > 0)
++    {
++      float floor_score = allPossibilities[0].totalscore * config->postProcessMatchFloor;
++      for (unsigned int z = 0; z < allPossibilities.size(); z++)
++        if (allPossibilities[z].totalscore < floor_score)
++          allPossibilities[z].matchesTemplate = false;
++    }
++
+     if (config->debugTiming)
+     {
+       timespec permutationEndTime;
+@@ -310,6 +408,9 @@ namespace alpr
+     permutations.push(make_pair(totalscore, v));
+ 
+     int consecutiveNonMatches = 0;
++    int expansions = 0;
++    bool searchForMatch = config->postProcessSearchForMatch && templateregion != "";
++    const int MAX_EXPANSIONS = topn * 100;
+     while (permutations.size() > 0)
+     {
+       // get the top permutation and analyze
+@@ -319,8 +420,16 @@ namespace alpr
+       else
+         consecutiveNonMatches += 1;
+       permutations.pop();
++      expansions++;
++
++      bool haveMatch = !allPossibilities.empty() && allPossibilities.back().matchesTemplate;
++      if (haveMatch)
++        searchForMatch = false;
+ 
+-      if (allPossibilities.size() >= topn || consecutiveNonMatches >= (topn*2))
++      bool full = allPossibilities.size() >= topn || consecutiveNonMatches >= (topn*2);
++      if (full && !searchForMatch)
++        break;
++      if (expansions >= MAX_EXPANSIONS)
+         break;
+ 
+       // add child permutations to queue
+@@ -422,6 +531,11 @@ namespace alpr
+     return v;
+   }
+ 
++  static bool ppResultCompare( const PPResult &left, const PPResult &right )
++  {
++    return left.totalscore > right.totalscore;
++  }
++
+   bool letterCompare( const Letter &left, const Letter &right )
+   {
+     if (left.totalscore < right.totalscore)
+diff --git a/src/openalpr/postprocess/postprocess.h b/src/openalpr/postprocess/postprocess.h
+index bd8855f..a8f9362 100644
+--- a/src/openalpr/postprocess/postprocess.h
++++ b/src/openalpr/postprocess/postprocess.h
+@@ -81,6 +81,8 @@ namespace alpr
+ 
+       void findAllPermutations(std::string templateregion, int topn);
+       bool analyzePermutation(std::vector<int> letterIndices, std::string templateregion, int topn);
++      bool matchesAnyRule(std::string templateregion, std::string text);
++      void repairConfusables(std::string templateregion, int topn);
+ 
+       void insertLetter(std::string letter, int line_index, int charPosition, float score);
+ 
